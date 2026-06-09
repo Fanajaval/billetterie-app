@@ -7,7 +7,6 @@ import { type NormBox, normToPixel } from "./boxes";
 import { getImageSizeAsync } from "./image";
 import { buildQrPayload } from "./ticketAuth";
 import {
-  fitNumberFontSize,
   longestTicketNumber,
   escapeHtml,
 } from "./ticketText";
@@ -166,11 +165,17 @@ export async function generateTicketsPdf(options: {
   const numPixels = numBoxes.map((b) => normToPixel(b, originalPageW, originalPageH));
 
   const longestNumber = longestTicketNumber(prefix, startNum, count, padding);
-  // Compute font sizes in mm — fitNumberFontSize is unit-agnostic (ratio-based)
+  // Compute font sizes in mm. fitNumberFontSize has a px-based floor of 8 that
+  // makes no sense in mm context (8mm would be huge). We compute the raw ratio
+  // result directly here without any absolute minimum.
   const numFontSizesMm = numPixels.map((box) => {
     const w_mm = roundMm((box.w * scaleX) / MM_TO_PX);
     const h_mm = roundMm((box.h * scaleY) / MM_TO_PX);
-    return fitNumberFontSize(longestNumber, w_mm, h_mm);
+    if (w_mm <= 0 || h_mm <= 0) return 1;
+    const byHeight = h_mm * 0.82;
+    const byWidth = w_mm / Math.max(longestNumber.length * 0.58, 1);
+    // No hard minimum — the box size chosen by the user governs the font size
+    return roundMm(Math.min(byHeight, byWidth));
   });
 
   const pagesContent: string[] = [];
@@ -286,6 +291,11 @@ ${pagesContent.map((content, idx) => {
 
   const filename = `billets_${prefix}${startNum}-${startNum + count - 1}.pdf`;
   const dest = new FileSystem.File(FileSystem.Paths.document, filename);
+  // Delete any pre-existing file with the same name so .move() never throws
+  // FileAlreadyExistsException (Android) or equivalent on iOS.
+  if (dest.exists) {
+    dest.delete();
+  }
   new FileSystem.File(uri).move(dest);
 
   if (await Sharing.isAvailableAsync()) {
