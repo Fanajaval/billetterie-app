@@ -43,7 +43,9 @@ export function TicketBuilder() {
   const [qrBoxes, setQrBoxes] = useState<NormBox[]>(() => defaultBoxes().qr);
   const [numBoxes, setNumBoxes] = useState<NormBox[]>(() => defaultBoxes().num);
 
-  const [count, setCount] = useState("10");
+  const [format, setFormat] = useState<"2x8" | "1x2">("2x8");
+  const [pageCount, setPageCount] = useState("1");
+  const [count, setCount] = useState("16");
   const [startNum, setStartNum] = useState("1");
   const [prefix, setPrefix] = useState("TKT-");
   const [padding, setPadding] = useState("4");
@@ -141,15 +143,49 @@ export function TicketBuilder() {
         linkBtn: { alignItems: "center", paddingVertical: 8 },
         linkBtnText: { color: colors.num, fontSize: 14, fontWeight: "500" },
         row: { flexDirection: "row", alignItems: "center", gap: 10 },
+        pickerContainer: { gap: 8 },
+        pickerOption: {
+          borderWidth: 1,
+          borderColor: colors.border,
+          borderRadius: radius.sm,
+          paddingHorizontal: 12,
+          paddingVertical: 10,
+          backgroundColor: colors.bg,
+        },
+        pickerOptionSelected: {
+          borderColor: colors.primary,
+          backgroundColor: colors.primaryLight,
+        },
+        pickerOptionText: {
+          fontSize: 13,
+          color: colors.text,
+          fontWeight: "500",
+        },
+        pickerOptionTextSelected: {
+          color: colors.primary,
+          fontWeight: "700",
+        },
+        inputDisabled: {
+          opacity: 0.6,
+        },
       }),
     [colors, radius],
   );
 
-  const countNum = Math.max(1, parseInt(count, 10) || 1);
+  // Calculate tickets per page based on format
+  const ticketsPerPage = format === "2x8" ? 16 : 2;
+  const pageCountNum = Math.max(1, parseInt(pageCount, 10) || 1);
+  const countNum = ticketsPerPage * pageCountNum;
+  
   const startNumVal = Math.max(0, parseInt(startNum, 10) || 0);
   const paddingNum = Math.max(0, parseInt(padding, 10) || 0);
   const sampleNumber = `${prefix}${String(startNumVal).padStart(paddingNum, "0")}`;
   const previewEnd = `${prefix}${String(startNumVal + countNum - 1).padStart(paddingNum, "0")}`;
+  
+  // Update count automatically when format or page count changes
+  useEffect(() => {
+    setCount(String(countNum));
+  }, [format, pageCountNum]);
 
   const resetBoxes = () => {
     const d = defaultBoxes();
@@ -242,6 +278,8 @@ export function TicketBuilder() {
         prefix,
         padding: paddingNum,
         eventId: DEFAULT_EVENT_ID,
+        format,
+        pageCount: pageCountNum,
         onProgress: setProgress,
       });
       const { addHistory } = await import("../lib/history");
@@ -405,12 +443,45 @@ export function TicketBuilder() {
 
             <View style={styles.fieldRow}>
               <View style={styles.fieldHalf}>
-                <Text style={styles.label}>Nombre de billets</Text>
+                <Text style={styles.label}>Format A4</Text>
+                <View style={styles.pickerContainer}>
+                  <Pressable
+                    style={[styles.pickerOption, format === "2x8" && styles.pickerOptionSelected]}
+                    onPress={() => setFormat("2x8")}
+                  >
+                    <Text style={[styles.pickerOptionText, format === "2x8" && styles.pickerOptionTextSelected]}>
+                      2 colonnes × 8 lignes (16 billets/page)
+                    </Text>
+                  </Pressable>
+                  <Pressable
+                    style={[styles.pickerOption, format === "1x2" && styles.pickerOptionSelected]}
+                    onPress={() => setFormat("1x2")}
+                  >
+                    <Text style={[styles.pickerOptionText, format === "1x2" && styles.pickerOptionTextSelected]}>
+                      1 colonne × 2 lignes (2 billets/page)
+                    </Text>
+                  </Pressable>
+                </View>
+              </View>
+              <View style={styles.fieldHalf}>
+                <Text style={styles.label}>Nombre de pages</Text>
                 <TextInput
                   style={styles.input}
-                  value={count}
-                  onChangeText={setCount}
+                  value={pageCount}
+                  onChangeText={setPageCount}
                   keyboardType="number-pad"
+                />
+              </View>
+            </View>
+
+            <View style={styles.fieldRow}>
+              <View style={styles.fieldHalf}>
+                <Text style={styles.label}>Nombre de billets</Text>
+                <TextInput
+                  style={[styles.input, styles.inputDisabled]}
+                  value={count}
+                  editable={false}
+                  selectTextOnFocus={false}
                 />
               </View>
               <View style={styles.fieldHalf}>
