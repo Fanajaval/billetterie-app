@@ -25,7 +25,11 @@ type ScanState =
   | { status: "valid"; ticket: string; eventId: string; duplicate: boolean }
   | { status: "invalid"; reason: string };
 
-const SCAN_COOLDOWN_MS = 2500;
+// Réduit à 1.5s : le cashier n'attend pas entre deux billets
+const SCAN_COOLDOWN_MS = 1500;
+
+// Paliers de zoom numérique disponibles
+const ZOOM_STEPS = [1, 1.5, 2, 3];
 
 export function TicketScanner() {
   const insets = useSafeAreaInsets();
@@ -33,7 +37,13 @@ export function TicketScanner() {
   const [permission, requestPermission] = useCameraPermissions();
   const [scanState, setScanState] = useState<ScanState>({ status: "idle" });
   const [paused, setPaused] = useState(false);
+  const [torchOn, setTorchOn] = useState(false);
+  const [zoomIndex, setZoomIndex] = useState(0); // index dans ZOOM_STEPS
   const lastScanRef = useRef<{ code: string; at: number }>({ code: "", at: 0 });
+
+  // zoom 0→1 : expo-camera attend une valeur entre 0 et 1
+  // 1x = 0.0, 1.5x ≈ 0.1, 2x ≈ 0.2, 3x ≈ 0.4 (approximation linéaire acceptable)
+  const zoomValue = (ZOOM_STEPS[zoomIndex] - 1) / (ZOOM_STEPS[ZOOM_STEPS.length - 1] - 1) * 0.4;
 
   const styles = useMemo(
     () =>
@@ -70,14 +80,67 @@ export function TicketScanner() {
           alignItems: "center",
           justifyContent: "center",
         },
-        scanFrame: {
-          width: "72%",
+        // Fond semi-transparent autour du cadre de scan
+        overlayMask: {
+          ...StyleSheet.absoluteFillObject,
+          backgroundColor: "rgba(0,0,0,0.45)",
+        },
+        scanFrameWrap: {
+          width: "62%",
           aspectRatio: 1,
-          borderWidth: 3,
-          borderColor: colors.surface,
-          borderRadius: radius.md,
+        },
+        scanFrame: {
+          flex: 1,
+          borderRadius: radius.sm,
           backgroundColor: "transparent",
         },
+        // Coins animés du cadre
+        corner: {
+          position: "absolute",
+          width: 22,
+          height: 22,
+          borderColor: "#ffffff",
+          borderWidth: 3,
+        },
+        cornerTL: { top: 0, left: 0, borderRightWidth: 0, borderBottomWidth: 0 },
+        cornerTR: { top: 0, right: 0, borderLeftWidth: 0, borderBottomWidth: 0 },
+        cornerBL: { bottom: 0, left: 0, borderRightWidth: 0, borderTopWidth: 0 },
+        cornerBR: { bottom: 0, right: 0, borderLeftWidth: 0, borderTopWidth: 0 },
+        // Barre de contrôles au bas de la caméra
+        controls: {
+          position: "absolute",
+          bottom: 12,
+          left: 0,
+          right: 0,
+          flexDirection: "row",
+          justifyContent: "center",
+          alignItems: "center",
+          gap: 12,
+        },
+        controlBtn: {
+          paddingHorizontal: 14,
+          paddingVertical: 8,
+          borderRadius: 20,
+          backgroundColor: "rgba(0,0,0,0.55)",
+          borderWidth: 1,
+          borderColor: "rgba(255,255,255,0.25)",
+          alignItems: "center",
+          justifyContent: "center",
+          minWidth: 60,
+        },
+        controlBtnActive: {
+          backgroundColor: "rgba(255,255,255,0.25)",
+          borderColor: "#ffffff",
+        },
+        controlBtnText: {
+          color: "#ffffff",
+          fontSize: 13,
+          fontWeight: "700",
+        },
+        // Feedback visuel immédiat sur le cadre
+        scanFrameValid: { borderColor: colors.success },
+        scanFrameInvalid: { borderColor: colors.num },
+        scanFrameChecking: { borderColor: colors.primary },
         resultCard: {
           marginHorizontal: 16,
           marginTop: 12,
@@ -90,6 +153,7 @@ export function TicketScanner() {
         },
         row: { flexDirection: "row", alignItems: "center", gap: 10 },
         hint: { fontSize: 14, color: colors.textMuted, textAlign: "center" },
+        hintSmall: { fontSize: 12, color: colors.textMuted, textAlign: "center" },
         validTitle: {
           fontSize: 18,
           fontWeight: "800",
@@ -151,6 +215,10 @@ export function TicketScanner() {
     setScanState({ status: "idle" });
     setPaused(false);
     lastScanRef.current = { code: "", at: 0 };
+  }, []);
+
+  const cycleZoom = useCallback(() => {
+    setZoomIndex((i) => (i + 1) % ZOOM_STEPS.length);
   }, []);
 
   const handleBarcode = useCallback(
@@ -249,6 +317,18 @@ export function TicketScanner() {
     );
   }
 
+  // Couleur du cadre selon l'état du scan
+  const frameStateStyle =
+    scanState.status === "valid"
+      ? styles.scanFrameValid
+      : scanState.status === "invalid"
+        ? styles.scanFrameInvalid
+        : scanState.status === "checking"
+          ? styles.scanFrameChecking
+          : null;
+
+  const zoomLabel = `${ZOOM_STEPS[zoomIndex]}×`;
+
   return (
     <View style={styles.root}>
       <View style={[styles.header, { paddingTop: insets.top + 8 }]}>
@@ -262,19 +342,52 @@ export function TicketScanner() {
         <CameraView
           style={styles.camera}
           facing="back"
+          zoom={zoomValue}
+          enableTorch={torchOn}
           barcodeScannerSettings={{ barcodeTypes: ["qr"] }}
           onBarcodeScanned={paused ? undefined : handleBarcode}
         />
-        <View style={styles.overlay}>
-          <View style={styles.scanFrame} />
+
+        {/* Masque semi-transparent + cadre de scan */}
+        <View style={styles.overlay} pointerEvents="none">
+          <View style={styles.overlayMask} />
+          <View style={styles.scanFrameWrap}>
+            {/* Fenêtre transparente (efface le masque) */}
+            <View style={[styles.scanFrame, frameStateStyle]} />
+            {/* Coins du cadre */}
+            <View style={[styles.corner, styles.cornerTL]} />
+            <View style={[styles.corner, styles.cornerTR]} />
+            <View style={[styles.corner, styles.cornerBL]} />
+            <View style={[styles.corner, styles.cornerBR]} />
+          </View>
+        </View>
+
+        {/* Boutons zoom + torche */}
+        <View style={styles.controls}>
+          <TouchableOpacity
+            style={[styles.controlBtn, torchOn && styles.controlBtnActive]}
+            onPress={() => setTorchOn((v) => !v)}
+          >
+            <Text style={styles.controlBtnText}>
+              {torchOn ? "🔦 ON" : "🔦 OFF"}
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.controlBtn} onPress={cycleZoom}>
+            <Text style={styles.controlBtnText}>🔍 {zoomLabel}</Text>
+          </TouchableOpacity>
         </View>
       </View>
 
       <View style={[styles.resultCard, { marginBottom: insets.bottom + 12 }]}>
         {scanState.status === "idle" && (
-          <Text style={styles.hint}>
-            Placez le QR code du billet dans le cadre
-          </Text>
+          <>
+            <Text style={styles.hint}>
+              Placez le QR code du billet dans le cadre
+            </Text>
+            <Text style={styles.hintSmall}>
+              Si le QR est petit, utilisez 🔍 pour zoomer
+            </Text>
+          </>
         )}
         {scanState.status === "checking" && (
           <View style={styles.row}>
@@ -299,7 +412,7 @@ export function TicketScanner() {
                 scanState.duplicate && styles.duplicateTitle,
               ]}
             >
-              {scanState.duplicate ? "Billet déjà scanné" : "Billet valide ✓"}
+              {scanState.duplicate ? "⚠️ Billet déjà scanné" : "✅ Billet valide"}
             </Text>
             <Text style={styles.ticketNumber}>{scanState.ticket}</Text>
             <Text style={styles.meta}>Événement : {scanState.eventId}</Text>

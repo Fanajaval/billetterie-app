@@ -16,7 +16,7 @@ function qrToSvg(payload: string, sizeMm: number): string {
   // stretched to fill its container via width/height="100%".
   const internalPx = Math.max(96, Math.round(sizeMm * 3.779)); // 96 DPI
   const typeNumber = 0; // Auto-detect version
-  const errorCorrectionLevel = "L"; // Lower density → better scan reliability
+  const errorCorrectionLevel = "M"; // Medium (15% redundancy) — much better on small printed QRs
   const qr = QRCode(typeNumber, errorCorrectionLevel);
   qr.addData(payload);
   qr.make();
