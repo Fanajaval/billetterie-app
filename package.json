@@ -25,6 +25,7 @@
     "expo-print": "~15.0.8",
     "expo-sharing": "~14.0.8",
     "expo-status-bar": "~3.0.9",
+    "firebase": "^12.14.0",
     "qrcode": "^1.5.4",
     "qrcode-generator": "^2.0.4",
     "react": "19.1.0",
