@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -8,21 +8,10 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
-import {
-  CameraView,
-  useCameraPermissions,
-  type BarcodeScanningResult,
-} from "expo-camera";
+import { CameraView, useCameraPermissions } from "expo-camera";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import {
-  Gesture,
-  GestureDetector,
-} from "react-native-gesture-handler";
-import Animated, {
-  useSharedValue,
-  useAnimatedProps,
-  clamp,
-} from "react-native-reanimated";
+import { Gesture, GestureDetector } from "react-native-gesture-handler";
+import { useSharedValue, runOnJS } from "react-native-reanimated";
 
 import { validateQrContent } from "../lib/ticketAuth";
 import {
@@ -42,19 +31,25 @@ type ScanState =
   | { status: "valid"; ticket: string; eventId: string; duplicate: boolean }
   | { status: "invalid"; reason: string };
 
-// Délai minimum entre deux scans du même QR (évite les doubles validations)
 const SCAN_COOLDOWN_MS = 1500;
 
-// Zoom : 0 = grand-angle, 1 = zoom max. On plafonne à 0.5 (au-delà l'image
-// devient trop floue sur la plupart des appareils)
+// expo-camera zoom : 0 = pas de zoom, 1 = zoom maximum de l'appareil.
+// On plafonne à 0.5 pour rester dans la plage optique utile.
 const ZOOM_MIN = 0;
 const ZOOM_MAX = 0.5;
 
-// Composant Camera animé pour injecter le zoom via Reanimated sans re-render
-const AnimatedCameraView = Animated.createAnimatedComponent(CameraView);
+// ---------------------------------------------------------------------------
+// Helper worklet-safe
+// ---------------------------------------------------------------------------
+
+/** Borne une valeur entre min et max — utilisable depuis le thread UI. */
+function clampValue(value: number, min: number, max: number): number {
+  "worklet";
+  return Math.max(min, Math.min(max, value));
+}
 
 // ---------------------------------------------------------------------------
-// Composant principal
+// Composant
 // ---------------------------------------------------------------------------
 
 export function TicketScanner() {
@@ -64,73 +59,51 @@ export function TicketScanner() {
   const [scanState, setScanState] = useState<ScanState>({ status: "idle" });
   const [paused, setPaused] = useState(false);
   const [torchOn, setTorchOn] = useState(false);
+  const [zoom, setZoom] = useState(ZOOM_MIN);
+  const [pinchHintVisible, setPinchHintVisible] = useState(true);
   const lastScanRef = useRef<{ code: string; at: number }>({
     code: "",
     at: 0,
   });
 
   // -------------------------------------------------------------------------
-  // Zoom par pincement (Reanimated + Gesture Handler)
+  // Pinch-to-zoom via Reanimated (thread UI) → runOnJS → setState React
   // -------------------------------------------------------------------------
-  const zoomBase = useSharedValue(ZOOM_MIN); // valeur au début du geste
-  const zoom = useSharedValue(ZOOM_MIN); // valeur courante transmise à la caméra
+  // La valeur de zoom vit sur le thread UI pendant le geste pour être fluide,
+  // puis est envoyée au thread JS (setState) à chaque frame via runOnJS.
+  // CameraView.zoom est une prop React normale (pas animable nativement) donc
+  // setState est la seule façon correcte de la mettre à jour.
+  const zoomBase = useSharedValue(ZOOM_MIN);
+
+  const applyZoom = useCallback((v: number) => {
+    setZoom(v);
+  }, []);
+
+  const hidePinchHint = useCallback(() => {
+    setPinchHintVisible(false);
+  }, []);
 
   const pinchGesture = Gesture.Pinch()
     .onBegin(() => {
-      // mémorise le zoom au moment où l'utilisateur commence à pincer
-      zoomBase.value = zoom.value;
+      zoomBase.value = zoom; // snapshot de la valeur JS courante
+      runOnJS(hidePinchHint)();
     })
     .onUpdate((e) => {
-      // scale > 1 = zoom avant ; scale < 1 = zoom arrière
-      // On mappe : delta de scale → delta de zoom (sensibilité ×0.3)
-      const next = zoomBase.value + (e.scale - 1) * 0.3;
-      zoom.value = clamp(next, ZOOM_MIN, ZOOM_MAX);
+      // (scale - 1) * sensibilité + base → zoom clamped
+      const next = clampValue(
+        zoomBase.value + (e.scale - 1) * 0.35,
+        ZOOM_MIN,
+        ZOOM_MAX,
+      );
+      runOnJS(applyZoom)(next);
     });
 
-  // Props animées : injectées directement dans le composant natif sans
-  // passer par le thread JS → zéro lag
-  const animatedProps = useAnimatedProps(() => ({
-    zoom: zoom.value,
-  }));
-
   // -------------------------------------------------------------------------
-  // Scanner natif (MLKit / DataScannerViewController)
+  // Validation QR
   // -------------------------------------------------------------------------
-  // Sur Android (MLKit) et iOS 16+ (DataScannerViewController), expo-camera
-  // propose un scanner natif avec highlight QR et pinch-to-zoom intégré.
-  // C'est le même moteur que les apps professionnelles de scan.
-  const [useNativeScanner] = useState(
-    () => CameraView.isModernBarcodeScannerAvailable,
-  );
 
-  // Abonnement au scanner natif
-  useEffect(() => {
-    if (!useNativeScanner) return;
-    const sub = CameraView.onModernBarcodeScanned(({ data }) => {
-      void handleBarcodeData(data);
-    });
-    return () => sub.remove();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [useNativeScanner, paused]);
-
-  const launchNativeScanner = useCallback(async () => {
-    try {
-      await CameraView.launchScanner({
-        barcodeTypes: ["qr"],
-        isPinchToZoomEnabled: true,   // pinch-to-zoom natif
-        isGuidanceEnabled: true,       // guide visuel "Ralentissez…"
-        isHighlightingEnabled: true,   // surbrillance du QR détecté
-      });
-    } catch {
-      // launchScanner rejeté si l'utilisateur ferme la modal avant le scan
-    }
-  }, []);
-
-  // -------------------------------------------------------------------------
-  // Logique de validation commune
-  // -------------------------------------------------------------------------
-  const handleBarcodeData = useCallback(
-    async (data: string) => {
+  const handleBarcode = useCallback(
+    async ({ data }: { data: string }) => {
       if (paused) return;
 
       const now = Date.now();
@@ -141,11 +114,6 @@ export function TicketScanner() {
         return;
       }
       lastScanRef.current = { code: data, at: now };
-
-      // Ferme le scanner natif dès qu'un code est détecté
-      if (useNativeScanner) {
-        await CameraView.dismissScanner();
-      }
 
       setPaused(true);
       setScanState({ status: "checking" });
@@ -168,14 +136,7 @@ export function TicketScanner() {
         duplicate,
       });
     },
-    [paused, useNativeScanner],
-  );
-
-  const handleBarcode = useCallback(
-    ({ data }: BarcodeScanningResult) => {
-      void handleBarcodeData(data);
-    },
-    [handleBarcodeData],
+    [paused],
   );
 
   const resetScan = useCallback(() => {
@@ -184,9 +145,25 @@ export function TicketScanner() {
     lastScanRef.current = { code: "", at: 0 };
   }, []);
 
+  const confirmClearHistory = useCallback(() => {
+    Alert.alert(
+      "Effacer l'historique ?",
+      "Les billets déjà scannés pourront être scannés à nouveau.",
+      [
+        { text: "Annuler", style: "cancel" },
+        {
+          text: "Effacer",
+          style: "destructive",
+          onPress: () => void clearScannedTickets().then(resetScan),
+        },
+      ],
+    );
+  }, [resetScan]);
+
   // -------------------------------------------------------------------------
   // Styles
   // -------------------------------------------------------------------------
+
   const styles = useMemo(
     () =>
       StyleSheet.create({
@@ -221,15 +198,15 @@ export function TicketScanner() {
           borderColor: colors.border,
         },
         camera: { flex: 1 },
+        // Overlay non-interactif au-dessus de la caméra
         overlay: {
           ...StyleSheet.absoluteFillObject,
           alignItems: "center",
           justifyContent: "center",
-          pointerEvents: "none",
         },
         overlayMask: {
           ...StyleSheet.absoluteFillObject,
-          backgroundColor: "rgba(0,0,0,0.45)",
+          backgroundColor: "rgba(0,0,0,0.42)",
         },
         scanFrameWrap: {
           width: "60%",
@@ -240,6 +217,7 @@ export function TicketScanner() {
           borderRadius: 4,
           backgroundColor: "transparent",
         },
+        // Coins du cadre
         corner: {
           position: "absolute",
           width: 24,
@@ -275,30 +253,30 @@ export function TicketScanner() {
           borderTopWidth: 0,
           borderBottomRightRadius: 4,
         },
+        // Couleur du cadre selon état
         scanFrameValid: { borderColor: colors.success },
         scanFrameInvalid: { borderColor: colors.num },
         scanFrameChecking: { borderColor: colors.primary },
-        // Barre de contrôles flottante
+        // Contrôles flottants en bas de la caméra
         controls: {
           position: "absolute",
-          bottom: 14,
+          bottom: 12,
           left: 0,
           right: 0,
           flexDirection: "row",
           justifyContent: "center",
-          alignItems: "center",
           gap: 10,
         },
         controlBtn: {
           paddingHorizontal: 16,
-          paddingVertical: 9,
+          paddingVertical: 8,
           borderRadius: 20,
-          backgroundColor: "rgba(0,0,0,0.6)",
+          backgroundColor: "rgba(0,0,0,0.58)",
           borderWidth: 1,
-          borderColor: "rgba(255,255,255,0.25)",
+          borderColor: "rgba(255,255,255,0.22)",
         },
         controlBtnActive: {
-          backgroundColor: "rgba(255,255,255,0.2)",
+          backgroundColor: "rgba(255,255,255,0.18)",
           borderColor: "#ffffff",
         },
         controlBtnText: {
@@ -306,20 +284,22 @@ export function TicketScanner() {
           fontSize: 13,
           fontWeight: "700",
         },
-        zoomHint: {
+        // Indication pinch (disparaît après le premier geste)
+        pinchHint: {
           position: "absolute",
-          top: 14,
+          top: 12,
           alignSelf: "center",
           paddingHorizontal: 12,
-          paddingVertical: 6,
-          borderRadius: 12,
+          paddingVertical: 5,
+          borderRadius: 10,
           backgroundColor: "rgba(0,0,0,0.5)",
         },
-        zoomHintText: {
-          color: "#ffffff",
+        pinchHintText: {
+          color: "rgba(255,255,255,0.85)",
           fontSize: 12,
           fontWeight: "600",
         },
+        // Résultats
         resultCard: {
           marginHorizontal: 16,
           marginTop: 12,
@@ -363,11 +343,7 @@ export function TicketScanner() {
           textAlign: "center",
           fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
         },
-        meta: {
-          fontSize: 13,
-          color: colors.textMuted,
-          textAlign: "center",
-        },
+        meta: { fontSize: 13, color: colors.textMuted, textAlign: "center" },
         primaryBtn: {
           backgroundColor: colors.primary,
           borderRadius: radius.sm,
@@ -394,25 +370,12 @@ export function TicketScanner() {
         },
         linkBtn: { alignItems: "center", paddingVertical: 4 },
         linkBtnText: { fontSize: 13, color: colors.textMuted },
-        nativeScannerBtn: {
-          backgroundColor: colors.primary,
-          borderRadius: radius.sm,
-          paddingVertical: 16,
-          alignItems: "center",
-          marginHorizontal: 16,
-          marginTop: 12,
-        },
-        nativeScannerBtnText: {
-          color: colors.surface,
-          fontSize: 16,
-          fontWeight: "700",
-        },
       }),
     [colors, radius],
   );
 
   // -------------------------------------------------------------------------
-  // Rendu — cas plateformes / permissions
+  // Rendu — web
   // -------------------------------------------------------------------------
 
   if (Platform.OS === "web") {
@@ -427,6 +390,10 @@ export function TicketScanner() {
     );
   }
 
+  // -------------------------------------------------------------------------
+  // Rendu — permissions en cours de chargement
+  // -------------------------------------------------------------------------
+
   if (!permission) {
     return (
       <View style={[styles.root, styles.centered]}>
@@ -434,6 +401,10 @@ export function TicketScanner() {
       </View>
     );
   }
+
+  // -------------------------------------------------------------------------
+  // Rendu — permission refusée
+  // -------------------------------------------------------------------------
 
   if (!permission.granted) {
     return (
@@ -459,7 +430,10 @@ export function TicketScanner() {
     );
   }
 
-  // Couleur du cadre selon état
+  // -------------------------------------------------------------------------
+  // Couleur du cadre selon l'état
+  // -------------------------------------------------------------------------
+
   const frameStateStyle =
     scanState.status === "valid"
       ? styles.scanFrameValid
@@ -469,114 +443,13 @@ export function TicketScanner() {
           ? styles.scanFrameChecking
           : null;
 
-  const confirmClearHistory = () => {
-    Alert.alert(
-      "Effacer l'historique ?",
-      "Les billets déjà scannés pourront être scannés à nouveau.",
-      [
-        { text: "Annuler", style: "cancel" },
-        {
-          text: "Effacer",
-          style: "destructive",
-          onPress: () => void clearScannedTickets().then(resetScan),
-        },
-      ],
-    );
-  };
-
   // -------------------------------------------------------------------------
-  // Rendu — scanner natif disponible (Android MLKit + iOS 16+)
+  // Rendu principal — caméra active dès l'entrée dans le menu
   // -------------------------------------------------------------------------
-  if (useNativeScanner) {
-    return (
-      <View style={styles.root}>
-        <View style={[styles.header, { paddingTop: insets.top + 8 }]}>
-          <Text style={styles.title}>Scanner</Text>
-          <Text style={styles.subtitle}>
-            QR chiffré — lecture impossible hors Billetterie
-          </Text>
-        </View>
 
-        {/* Bouton d'ouverture du scanner natif (plein écran, MLKit) */}
-        {!paused && (
-          <TouchableOpacity
-            style={styles.nativeScannerBtn}
-            onPress={() => void launchNativeScanner()}
-          >
-            <Text style={styles.nativeScannerBtnText}>
-              📷 Scanner un billet
-            </Text>
-          </TouchableOpacity>
-        )}
-
-        <View style={[styles.resultCard, { marginBottom: insets.bottom + 12 }]}>
-          {scanState.status === "idle" && (
-            <>
-              <Text style={styles.hint}>
-                Appuyez sur le bouton pour scanner
-              </Text>
-              <Text style={styles.hintSmall}>
-                Le scanner détecte les QR codes même en petite taille.
-                Pincez pour zoomer.
-              </Text>
-            </>
-          )}
-          {scanState.status === "checking" && (
-            <View style={styles.row}>
-              <ActivityIndicator color={colors.primary} />
-              <Text style={styles.hint}>Vérification de la signature…</Text>
-            </View>
-          )}
-          {scanState.status === "invalid" && (
-            <>
-              <Text style={styles.invalidTitle}>Billet refusé</Text>
-              <Text style={styles.invalidText}>{scanState.reason}</Text>
-              <TouchableOpacity style={styles.secondaryBtn} onPress={resetScan}>
-                <Text style={styles.secondaryBtnText}>Scanner à nouveau</Text>
-              </TouchableOpacity>
-            </>
-          )}
-          {scanState.status === "valid" && (
-            <>
-              <Text
-                style={[
-                  styles.validTitle,
-                  scanState.duplicate && styles.duplicateTitle,
-                ]}
-              >
-                {scanState.duplicate
-                  ? "⚠️ Billet déjà scanné"
-                  : "✅ Billet valide"}
-              </Text>
-              <Text style={styles.ticketNumber}>{scanState.ticket}</Text>
-              <Text style={styles.meta}>Événement : {scanState.eventId}</Text>
-              <TouchableOpacity style={styles.primaryBtn} onPress={resetScan}>
-                <Text style={styles.primaryBtnText}>
-                  Scanner un autre billet
-                </Text>
-              </TouchableOpacity>
-            </>
-          )}
-
-          <TouchableOpacity
-            style={styles.linkBtn}
-            onPress={confirmClearHistory}
-          >
-            <Text style={styles.linkBtnText}>
-              Effacer l'historique des scans
-            </Text>
-          </TouchableOpacity>
-        </View>
-      </View>
-    );
-  }
-
-  // -------------------------------------------------------------------------
-  // Rendu — scanner custom avec pinch-to-zoom Reanimated (fallback)
-  // Utilisé sur iOS < 16 ou si le scanner natif n'est pas disponible.
-  // -------------------------------------------------------------------------
   return (
     <View style={styles.root}>
+      {/* En-tête */}
       <View style={[styles.header, { paddingTop: insets.top + 8 }]}>
         <Text style={styles.title}>Scanner</Text>
         <Text style={styles.subtitle}>
@@ -584,25 +457,30 @@ export function TicketScanner() {
         </Text>
       </View>
 
-      {/* Zone caméra avec gesture de pincement */}
+      {/* Zone caméra avec geste de pincement */}
       <GestureDetector gesture={pinchGesture}>
         <View style={styles.cameraWrap}>
-          <AnimatedCameraView
+          {/* Caméra — ouverte immédiatement, scan actif sauf si paused */}
+          <CameraView
             style={styles.camera}
             facing="back"
-            // autofocus "off" = autofocus continu (le nom est contre-intuitif
-            // dans expo-camera : "off" désactive le verrou, pas l'AF)
-            autofocus="off"
+            zoom={zoom}
             enableTorch={torchOn}
             barcodeScannerSettings={{ barcodeTypes: ["qr"] }}
             onBarcodeScanned={paused ? undefined : handleBarcode}
-            animatedProps={animatedProps}
           />
 
-          {/* Masque + cadre */}
-          <View style={styles.overlay}>
-            <View style={styles.overlayMask} />
-            <View style={styles.scanFrameWrap}>
+          {/* Masque semi-transparent + cadre de visée */}
+          <View
+            style={styles.overlay}
+            // pointerEvents box-none : les touches passent au travers vers la caméra
+            pointerEvents="box-none"
+          >
+            <View
+              style={styles.overlayMask}
+              pointerEvents="none"
+            />
+            <View style={styles.scanFrameWrap} pointerEvents="none">
               <View style={[styles.scanFrame, frameStateStyle]} />
               <View style={[styles.corner, styles.cornerTL]} />
               <View style={[styles.corner, styles.cornerTR]} />
@@ -611,27 +489,30 @@ export function TicketScanner() {
             </View>
           </View>
 
-          {/* Indication zoom */}
-          <View style={styles.zoomHint} pointerEvents="none">
-            <Text style={styles.zoomHintText}>
-              Pincez pour zoomer
-            </Text>
-          </View>
+          {/* Indication "Pincez pour zoomer" — disparaît au premier geste */}
+          {pinchHintVisible && (
+            <View style={styles.pinchHint} pointerEvents="none">
+              <Text style={styles.pinchHintText}>
+                🤌 Pincez pour zoomer
+              </Text>
+            </View>
+          )}
 
           {/* Bouton torche */}
-          <View style={styles.controls}>
+          <View style={styles.controls} pointerEvents="box-none">
             <TouchableOpacity
               style={[styles.controlBtn, torchOn && styles.controlBtnActive]}
               onPress={() => setTorchOn((v) => !v)}
             >
               <Text style={styles.controlBtnText}>
-                {torchOn ? "🔦 Torche ON" : "🔦 Torche"}
+                {torchOn ? "🔦 ON" : "🔦 Torche"}
               </Text>
             </TouchableOpacity>
           </View>
         </View>
       </GestureDetector>
 
+      {/* Carte résultat */}
       <View style={[styles.resultCard, { marginBottom: insets.bottom + 12 }]}>
         {scanState.status === "idle" && (
           <>
@@ -643,12 +524,14 @@ export function TicketScanner() {
             </Text>
           </>
         )}
+
         {scanState.status === "checking" && (
           <View style={styles.row}>
             <ActivityIndicator color={colors.primary} />
             <Text style={styles.hint}>Vérification de la signature…</Text>
           </View>
         )}
+
         {scanState.status === "invalid" && (
           <>
             <Text style={styles.invalidTitle}>Billet refusé</Text>
@@ -658,6 +541,7 @@ export function TicketScanner() {
             </TouchableOpacity>
           </>
         )}
+
         {scanState.status === "valid" && (
           <>
             <Text
@@ -681,9 +565,7 @@ export function TicketScanner() {
         )}
 
         <TouchableOpacity style={styles.linkBtn} onPress={confirmClearHistory}>
-          <Text style={styles.linkBtnText}>
-            Effacer l'historique des scans
-          </Text>
+          <Text style={styles.linkBtnText}>Effacer l'historique des scans</Text>
         </TouchableOpacity>
       </View>
     </View>
