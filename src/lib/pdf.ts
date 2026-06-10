@@ -91,7 +91,7 @@ export async function generateTicketsPdf(options: {
   prefix: string;
   padding: number;
   eventId: string;
-  format: "2x8" | "1x2";
+  format: "2x8" | "1x3" | "1x2";
   pageCount: number;
   onProgress: (percent: number) => void;
 }): Promise<{ filename: string; firstThumb?: string }> {
@@ -128,7 +128,7 @@ export async function generateTicketsPdf(options: {
 
   // Calculate grid dimensions based on format
   const cols = format === "2x8" ? 2 : 1;
-  const rows = format === "2x8" ? 8 : 2;
+  const rows = format === "2x8" ? 8 : format === "1x3" ? 3 : 2;
   const ticketsPerGridPage = cols * rows;
 
   // NO MARGINS, NO GAPS - tickets fill the entire page exactly

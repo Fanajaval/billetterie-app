@@ -43,7 +43,7 @@ export function TicketBuilder() {
   const [qrBoxes, setQrBoxes] = useState<NormBox[]>(() => defaultBoxes().qr);
   const [numBoxes, setNumBoxes] = useState<NormBox[]>(() => defaultBoxes().num);
 
-  const [format, setFormat] = useState<"2x8" | "1x2">("2x8");
+  const [format, setFormat] = useState<"2x8" | "1x3" | "1x2">("2x8");
   const [pageCount, setPageCount] = useState("1");
   const [count, setCount] = useState("16");
   const [startNum, setStartNum] = useState("1");
@@ -173,7 +173,7 @@ export function TicketBuilder() {
   );
 
   // Calculate tickets per page based on format
-  const ticketsPerPage = format === "2x8" ? 16 : 2;
+  const ticketsPerPage = format === "2x8" ? 16 : format === "1x3" ? 3 : 2;
   const pageCountNum = Math.max(1, parseInt(pageCount, 10) || 1);
   const countNum = ticketsPerPage * pageCountNum;
   
@@ -451,6 +451,14 @@ export function TicketBuilder() {
                   >
                     <Text style={[styles.pickerOptionText, format === "2x8" && styles.pickerOptionTextSelected]}>
                       2 colonnes × 8 lignes (16 billets/page)
+                    </Text>
+                  </Pressable>
+                  <Pressable
+                    style={[styles.pickerOption, format === "1x3" && styles.pickerOptionSelected]}
+                    onPress={() => setFormat("1x3")}
+                  >
+                    <Text style={[styles.pickerOptionText, format === "1x3" && styles.pickerOptionTextSelected]}>
+                      1 colonne × 3 lignes (3 billets/page)
                     </Text>
                   </Pressable>
                   <Pressable
