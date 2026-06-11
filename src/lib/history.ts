@@ -35,12 +35,15 @@ export async function getHistory(): Promise<HistoryEntry[]> {
 
 export async function addHistory(entry: HistoryEntry): Promise<void> {
   try {
-    const docRef = await addDoc(collection(db, COLLECTION_NAME), entry);
+    // Créer une copie sans la thumbnail pour Firebase (trop grosse pour Firestore)
+    const { thumbnail, ...entryWithoutThumb } = entry;
+    const docRef = await addDoc(collection(db, COLLECTION_NAME), entryWithoutThumb);
     entry.id = docRef.id;
   } catch (e) {
     console.error("Erreur addHistory:", e);
   }
   
+  // Sauvegarder localement AVEC la thumbnail
   const history = [entry, ...(await getHistory())].slice(0, MAX_ENTRIES);
   await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(history));
 }

@@ -181,7 +181,60 @@ export async function generateTicketsPdf(options: {
   const pagesContent: string[] = [];
   let firstThumb: string | undefined;
 
-  // Generate A4 pages with grids of tickets
+  // OPTIMIZATION: Pre-generate ALL QR codes in parallel batches
+  const qrCache = new Map<string, string>();
+  const totalTickets = Math.min(count, pageCount * ticketsPerGridPage);
+  
+  console.log(`[PDF] Génération de ${totalTickets} QR codes en parallèle...`);
+  const startTime = Date.now();
+  
+  // Generate all ticket numbers first
+  const ticketNumbers: string[] = [];
+  for (let i = 0; i < totalTickets; i++) {
+    const ticketNumber = startNum + i;
+    const numberStr = `${prefix}${String(ticketNumber).padStart(padding, "0")}`;
+    ticketNumbers.push(numberStr);
+  }
+  
+  // Generate QR codes in larger parallel batches (50 at a time)
+  const BATCH_SIZE = 50;
+  for (let batchStart = 0; batchStart < totalTickets; batchStart += BATCH_SIZE) {
+    const batchEnd = Math.min(batchStart + BATCH_SIZE, totalTickets);
+    
+    // Generate all payloads in this batch in parallel
+    const batchPromises = ticketNumbers
+      .slice(batchStart, batchEnd)
+      .map(async (numberStr) => {
+        const qrPayload = await buildQrPayload(numberStr, eventId);
+        // Generate SVG immediately after payload
+        const svg = qrToSvg(qrPayload, 20); // Use a default size, will be scaled in CSS
+        return { numberStr, svg };
+      });
+    
+    const batchResults = await Promise.all(batchPromises);
+    
+    // Store in cache
+    for (const { numberStr, svg } of batchResults) {
+      qrCache.set(numberStr, svg);
+    }
+    
+    // Update progress during QR generation (first 60% of progress)
+    const progress = Math.round((batchEnd / totalTickets) * 60);
+    onProgress(progress);
+    
+    // Log every 100 tickets
+    if (batchEnd % 100 === 0 || batchEnd === totalTickets) {
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      const rate = (batchEnd / (Date.now() - startTime) * 1000).toFixed(1);
+      console.log(`[PDF] ${batchEnd}/${totalTickets} QR générés (${elapsed}s, ${rate} QR/s)`);
+    }
+  }
+  
+  const qrTime = ((Date.now() - startTime) / 1000).toFixed(1);
+  console.log(`[PDF] ✅ Tous les QR codes générés en ${qrTime}s`);
+
+  // Generate A4 pages with grids of tickets (using cached QR codes)
+  const htmlStartTime = Date.now();
   for (let pageIdx = 0; pageIdx < pageCount; pageIdx++) {
     let pageHtml = "";
     
@@ -193,22 +246,26 @@ export async function generateTicketsPdf(options: {
 
         const ticketNumber = startNum + ticketIdx;
         const numberStr = `${prefix}${String(ticketNumber).padStart(padding, "0")}`;
-        const qrPayload = await buildQrPayload(numberStr, eventId);
+        
+        // Get pre-generated QR code from cache
+        const cachedSvg = qrCache.get(numberStr);
+        if (!cachedSvg) {
+          console.warn(`[PDF] QR manquant pour ${numberStr}`);
+          continue;
+        }
 
         // Position of this ticket cell on the A4 page (in mm, bord à bord)
         const cellX = roundMm(col * ticketW);
         const cellY = roundMm(row * ticketH);
 
-        // Build ticket HTML with mm units
+        // Build ticket HTML with mm units using cached QR
         const qrHtml = qrPixels
           .map((box) => {
             const x_mm = roundMm((box.x * scaleX) / MM_TO_PX);
             const y_mm = roundMm((box.y * scaleY) / MM_TO_PX);
             const w_mm = roundMm((box.w * scaleX) / MM_TO_PX);
             const h_mm = roundMm((box.h * scaleY) / MM_TO_PX);
-            const svgSize_mm = Math.min(w_mm, h_mm);
-            const svg = qrToSvg(qrPayload, svgSize_mm);
-            return `<div style="position:absolute;left:${x_mm}mm;top:${y_mm}mm;width:${w_mm}mm;height:${h_mm}mm;display:flex;align-items:center;justify-content:center;overflow:visible;">${svg}</div>`;
+            return `<div style="position:absolute;left:${x_mm}mm;top:${y_mm}mm;width:${w_mm}mm;height:${h_mm}mm;display:flex;align-items:center;justify-content:center;overflow:visible;">${cachedSvg}</div>`;
           })
           .join("");
 
@@ -221,7 +278,6 @@ export async function generateTicketsPdf(options: {
             const fontSize_mm = roundMm(numFontSizesMm[i] ?? 3);
             const safe = escapeHtml(numberStr);
             const strokeW = roundMm(Math.max(0.1, fontSize_mm * 0.1));
-            // viewBox uses the same mm values so 1 SVG user unit = 1 mm
             return `<svg xmlns="http://www.w3.org/2000/svg" style="position:absolute;left:${x_mm}mm;top:${y_mm}mm;width:${w_mm}mm;height:${h_mm}mm;overflow:visible;pointer-events:none;" viewBox="0 0 ${w_mm} ${h_mm}">
               <text x="${roundMm(w_mm / 2)}" y="${roundMm(h_mm / 2)}" dominant-baseline="central" text-anchor="middle"
                 font-family="Arial, Helvetica, sans-serif" font-weight="800" font-size="${fontSize_mm}"
@@ -235,7 +291,7 @@ export async function generateTicketsPdf(options: {
 
         pageHtml += `<div style="position:absolute;left:${cellX}mm;top:${cellY}mm;width:${ticketW}mm;height:${ticketH}mm;">
           <div style="position:relative;width:100%;height:100%;overflow:visible;">
-            <img src="${imgDataUrl}" style="position:absolute;left:0;top:0;width:100%;height:100%;display:block;object-fit:fill;" />
+            <div class="ticket-bg"></div>
             ${qrHtml}
             ${numHtml}
           </div>
@@ -248,8 +304,16 @@ export async function generateTicketsPdf(options: {
       firstThumb = imgDataUrl;
     }
 
-    onProgress(Math.round(((pageIdx + 1) / pageCount) * 100));
+    // HTML generation progress: 60-80%
+    const htmlProgress = 60 + Math.round(((pageIdx + 1) / pageCount) * 20);
+    onProgress(htmlProgress);
   }
+  
+  const htmlTime = ((Date.now() - htmlStartTime) / 1000).toFixed(1);
+  console.log(`[PDF] ✅ HTML construit en ${htmlTime}s`);
+  
+  // Progress 80%: Starting PDF rendering
+  onProgress(80);
 
   const html = `<!DOCTYPE html>
 <html>
@@ -270,6 +334,18 @@ export async function generateTicketsPdf(options: {
       overflow: hidden; 
       background: white;
     }
+    .ticket-bg {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+      object-fit: fill;
+      background-image: url('${imgDataUrl}');
+      background-size: 100% 100%;
+      background-repeat: no-repeat;
+    }
   </style>
 </head>
 <body>
@@ -281,6 +357,9 @@ ${pagesContent.map((content, idx) => {
 </body>
 </html>`;
 
+  console.log(`[PDF] Début rendu PDF par expo-print...`);
+  const printStartTime = Date.now();
+
   const { uri } = await Print.printToFileAsync({
     html,
     width: A4_WIDTH_PX,
@@ -288,6 +367,12 @@ ${pagesContent.map((content, idx) => {
     // iOS: force zero margins so the WebView doesn't add its own padding
     margins: { top: 0, right: 0, bottom: 0, left: 0 },
   });
+  
+  const printTime = ((Date.now() - printStartTime) / 1000).toFixed(1);
+  console.log(`[PDF] ✅ PDF rendu en ${printTime}s`);
+  
+  // Progress 95%
+  onProgress(95);
 
   const filename = `billets_${prefix}${startNum}-${startNum + count - 1}.pdf`;
   const dest = new FileSystem.File(FileSystem.Paths.document, filename);
@@ -305,6 +390,10 @@ ${pagesContent.map((content, idx) => {
       UTI: "com.adobe.pdf",
     });
   }
+  
+  const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
+  console.log(`[PDF] ✅ TERMINÉ en ${totalTime}s total`);
+  onProgress(100);
 
   return { filename, firstThumb };
 }
